@@ -1,8 +1,7 @@
 # GeminiCLI to API
 
-**将 GeminiCLI 转换为 OpenAI 和 GEMINI API 接口**
+**将 GeminiCLI 和 antigravity 转换为 OpenAI 和 GEMINI API 接口**
 
-[![CI](https://github.com/su-kaka/gcli2api/workflows/CI/badge.svg)](https://github.com/su-kaka/gcli2api/actions)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License: CNC-1.0](https://img.shields.io/badge/License-CNC--1.0-red.svg)](LICENSE)
 [![Docker](https://img.shields.io/badge/docker-available-blue.svg)](https://github.com/su-kaka/gcli2api/pkgs/container/gcli2api)
@@ -33,10 +32,6 @@
 - 提供付费服务或产品
 - 商业竞争用途
 
----
-
-## 控制面板演示网址：https://gcli2api-9xbf.onrender.com 密码：pwd
-
 ## 核心功能
 
 ### 🔄 API 端点和格式支持
@@ -50,6 +45,11 @@
 - **Gemini 原生端点**：`/v1/models/{model}:generateContent` 和 `streamGenerateContent`
   - 支持完整的 Gemini 原生 API 规范
   - 多种认证方式：Bearer Token、x-goog-api-key 头部、URL 参数 key
+- **Antigravity API 支持**：同时支持 OpenAI 和 Gemini 格式
+  - OpenAI 格式端点：`/antigravity/v1/chat/completions`
+  - Gemini 格式端点：`/antigravity/v1/models/{model}:generateContent` 和 `streamGenerateContent`
+  - 支持所有 Antigravity 模型（Claude、Gemini 等）
+  - 自动模型名称映射和思维模式检测
 
 ### 🔐 认证和安全管理
 
@@ -94,7 +94,7 @@
 ### 🎛️ Web 管理控制台
 
 **全功能 Web 界面**
-- OAuth 认证流程管理
+- OAuth 认证流程管理（支持 GCLI 和 Antigravity 双模式）
 - 凭证文件上传、下载、管理
 - 实时日志查看（WebSocket）
 - 系统配置管理
@@ -102,17 +102,18 @@
 - 移动端适配界面
 
 **批量操作支持**
-- ZIP 文件批量上传凭证
+- ZIP 文件批量上传凭证（GCLI 和 Antigravity）
 - 批量启用/禁用/删除凭证
 - 批量获取用户邮箱
 - 批量配置管理
+- 统一批量上传界面管理所有凭证类型
 
 ### 📈 使用统计和监控
 
 **详细使用统计**
 - 按凭证文件统计调用次数
 - Gemini 2.5 Pro 模型专项统计
-- 每日配额管理（UTC+7 重置）
+- 每日配额管理
 - 聚合统计和分析
 - 自定义每日限制配置
 
@@ -145,16 +146,9 @@
 ### 🔄 环境变量和配置管理
 
 **灵活的配置方式**
-- TOML 配置文件支持
 - 环境变量配置
 - 热配置更新（部分配置项）
 - 配置锁定（环境变量优先级）
-
-**环境变量凭证支持**
-- `GCLI_CREDS_*` 格式环境变量导入
-- 自动加载环境变量凭证
-- Base64 编码凭证支持
-- Docker 容器友好
 
 ## 支持的模型
 
@@ -296,6 +290,8 @@ docker run -d --name gcli2api --network host -e API_PASSWORD=api_pwd -e PANEL_PA
 
 1. 访问 `http://127.0.0.1:7861/auth` （默认端口，可通过 PORT 环境变量修改）
 2. 完成 OAuth 认证流程（默认密码：`pwd`，可通过环境变量修改）
+   - **GCLI 模式**：用于获取 Google Cloud Gemini API 凭证
+   - **Antigravity 模式**：用于获取 Google Antigravity API 凭证
 3. 配置客户端：
 
 **OpenAI 兼容客户端：**
@@ -306,8 +302,27 @@ docker run -d --name gcli2api --network host -e API_PASSWORD=api_pwd -e PANEL_PA
    - **端点地址**：`http://127.0.0.1:7861`
    - **认证方式**：
      - `Authorization: Bearer your_api_password`
-     - `x-goog-api-key: your_api_password` 
+     - `x-goog-api-key: your_api_password`
      - URL 参数：`?key=your_api_password`
+
+### 🌟 双认证模式支持
+
+**GCLI 认证模式**
+- 标准的 Google Cloud Gemini API 认证
+- 支持 OAuth2.0 认证流程
+- 自动启用必需的 Google Cloud API
+
+**Antigravity 认证模式**
+- Google Antigravity API 专用认证
+- 独立的凭证管理系统
+- 支持批量上传和管理
+- 与 GCLI 凭证完全隔离
+
+**统一管理界面**
+- 在"批量上传"标签页中可一次性管理两种凭证
+- 上半部分：GCLI 凭证批量上传（蓝色主题）
+- 下半部分：Antigravity 凭证批量上传（绿色主题）
+- 各自独立的凭证管理标签页
 
 ## 💾 数据存储模式
 
@@ -520,44 +535,19 @@ export MONGODB_URI="mongodb://localhost:27017/gcli2api?readPreference=secondaryP
 - `MONGODB_URI`: MongoDB 连接字符串（设置后启用 MongoDB 模式）
 - `MONGODB_DATABASE`: MongoDB 数据库名称（默认：gcli2api）
 
-**凭证配置**
-
-支持使用 `GCLI_CREDS_*` 环境变量导入多个凭证：
-
-#### 凭证环境变量使用示例
-
-**方式 1：编号格式**
-```bash
-export GCLI_CREDS_1='{"client_id":"your-client-id","client_secret":"your-secret","refresh_token":"your-token","token_uri":"https://oauth2.googleapis.com/token","project_id":"your-project"}'
-export GCLI_CREDS_2='{"client_id":"...","project_id":"..."}'
-```
-
-**方式 2：项目名格式**
-```bash
-export GCLI_CREDS_myproject='{"client_id":"...","project_id":"myproject",...}'
-export GCLI_CREDS_project2='{"client_id":"...","project_id":"project2",...}'
-```
-
-**启用自动加载**
-```bash
-export AUTO_LOAD_ENV_CREDS=true  # 程序启动时自动导入环境变量凭证
-```
-
 **Docker 使用示例**
 ```bash
 # 使用通用密码
 docker run -d --name gcli2api \
   -e PASSWORD=mypassword \
-  -e PORT=8080 \
-  -e GOOGLE_CREDENTIALS="$(cat credential.json | base64 -w 0)" \
+  -e PORT=7861 \
   ghcr.io/su-kaka/gcli2api:latest
 
 # 使用分离密码
 docker run -d --name gcli2api \
   -e API_PASSWORD=my_api_password \
   -e PANEL_PASSWORD=my_panel_password \
-  -e PORT=8080 \
-  -e GOOGLE_CREDENTIALS="$(cat credential.json | base64 -w 0)" \
+  -e PORT=7861 \
   ghcr.io/su-kaka/gcli2api:latest
 ```
 
@@ -565,11 +555,11 @@ docker run -d --name gcli2api \
 
 ### API 使用方式
 
-本服务支持两套完整的 API 端点：
+本服务支持三套完整的 API 端点：
 
-#### 1. OpenAI 兼容端点
+#### 1. OpenAI 兼容端点（GCLI）
 
-**端点：** `/v1/chat/completions`  
+**端点：** `/v1/chat/completions`
 **认证：** `Authorization: Bearer your_api_password`
 
 支持两种请求格式，会自动检测并处理：
@@ -601,15 +591,15 @@ docker run -d --name gcli2api \
 }
 ```
 
-#### 2. Gemini 原生端点
+#### 2. Gemini 原生端点（GCLI）
 
-**非流式端点：** `/v1/models/{model}:generateContent`  
-**流式端点：** `/v1/models/{model}:streamGenerateContent`  
+**非流式端点：** `/v1/models/{model}:generateContent`
+**流式端点：** `/v1/models/{model}:streamGenerateContent`
 **模型列表：** `/v1/models`
 
 **认证方式（任选一种）：**
 - `Authorization: Bearer your_api_password`
-- `x-goog-api-key: your_api_password`  
+- `x-goog-api-key: your_api_password`
 - URL 参数：`?key=your_api_password`
 
 **请求示例：**
@@ -633,6 +623,69 @@ curl -X POST "http://127.0.0.1:7861/v1/models/gemini-2.5-pro:streamGenerateConte
     ]
   }'
 ```
+
+#### 3. Antigravity API 端点
+
+**支持双格式：OpenAI 和 Gemini**
+
+##### Antigravity OpenAI 格式端点
+
+**端点：** `/antigravity/v1/chat/completions`
+**认证：** `Authorization: Bearer your_api_password`
+
+**请求示例：**
+```bash
+curl -X POST "http://127.0.0.1:7861/antigravity/v1/chat/completions" \
+  -H "Authorization: Bearer your_api_password" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "messages": [
+      {"role": "user", "content": "Hello"}
+    ],
+    "stream": true
+  }'
+```
+
+##### Antigravity Gemini 格式端点
+
+**非流式端点：** `/antigravity/v1/models/{model}:generateContent`
+**流式端点：** `/antigravity/v1/models/{model}:streamGenerateContent`
+
+**认证方式（任选一种）：**
+- `Authorization: Bearer your_api_password`
+- `x-goog-api-key: your_api_password`
+- URL 参数：`?key=your_api_password`
+
+**请求示例：**
+```bash
+# Gemini 格式非流式请求
+curl -X POST "http://127.0.0.1:7861/antigravity/v1/models/claude-sonnet-4-5:generateContent" \
+  -H "x-goog-api-key: your_api_password" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contents": [
+      {"role": "user", "parts": [{"text": "Hello"}]}
+    ],
+    "generationConfig": {
+      "temperature": 0.7
+    }
+  }'
+
+# Gemini 格式流式请求
+curl -X POST "http://127.0.0.1:7861/antigravity/v1/models/gemini-2.5-flash:streamGenerateContent?key=your_api_password" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contents": [
+      {"role": "user", "parts": [{"text": "Hello"}]}
+    ]
+  }'
+```
+
+**支持的 Antigravity 模型：**
+- Claude 系列：`claude-sonnet-4-5`、`claude-opus-4-5` 等
+- Gemini 系列：`gemini-2.5-flash`、`gemini-2.5-pro` 等
+- 自动支持思维模型（thinking models）
 
 **Gemini 原生banana：**
 ```python
@@ -683,19 +736,31 @@ for part in response.candidates[0].content.parts:
 
 **认证端点**
 - `POST /auth/login` - 用户登录
-- `POST /auth/start` - 开始 OAuth 认证
+- `POST /auth/start` - 开始 GCLI OAuth 认证
+- `POST /auth/antigravity/start` - 开始 Antigravity OAuth 认证
 - `POST /auth/callback` - 处理 OAuth 回调
 - `GET /auth/status/{project_id}` - 检查认证状态
+- `GET /auth/antigravity/credentials` - 获取 Antigravity 凭证
 
-**凭证管理端点**
-- `GET /creds/status` - 获取所有凭证状态
-- `POST /creds/action` - 单个凭证操作（启用/禁用/删除）
-- `POST /creds/batch-action` - 批量凭证操作
-- `POST /auth/upload` - 批量上传凭证文件（支持 ZIP）
-- `GET /creds/download/{filename}` - 下载凭证文件
-- `GET /creds/download-all` - 打包下载所有凭证
-- `POST /creds/fetch-email/{filename}` - 获取用户邮箱
-- `POST /creds/refresh-all-emails` - 批量刷新用户邮箱
+**GCLI 凭证管理端点**
+- `GET /creds/status` - 获取所有 GCLI 凭证状态
+- `POST /creds/action` - 单个 GCLI 凭证操作（启用/禁用/删除）
+- `POST /creds/batch-action` - 批量 GCLI 凭证操作
+- `POST /auth/upload` - 批量上传 GCLI 凭证文件（支持 ZIP）
+- `GET /creds/download/{filename}` - 下载 GCLI 凭证文件
+- `GET /creds/download-all` - 打包下载所有 GCLI 凭证
+- `POST /creds/fetch-email/{filename}` - 获取 GCLI 用户邮箱
+- `POST /creds/refresh-all-emails` - 批量刷新 GCLI 用户邮箱
+
+**Antigravity 凭证管理端点**
+- `GET /antigravity/creds/status` - 获取所有 Antigravity 凭证状态
+- `POST /antigravity/creds/action` - 单个 Antigravity 凭证操作（启用/禁用/删除）
+- `POST /antigravity/creds/batch-action` - 批量 Antigravity 凭证操作
+- `POST /antigravity/auth/upload` - 批量上传 Antigravity 凭证文件（支持 ZIP）
+- `GET /antigravity/creds/download/{filename}` - 下载 Antigravity 凭证文件
+- `GET /antigravity/creds/download-all` - 打包下载所有 Antigravity 凭证
+- `POST /antigravity/creds/fetch-email/{filename}` - 获取 Antigravity 用户邮箱
+- `POST /antigravity/creds/refresh-all-emails` - 批量刷新 Antigravity 用户邮箱
 
 **配置管理端点**
 - `GET /config/get` - 获取当前配置

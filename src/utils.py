@@ -1,10 +1,43 @@
 import platform
-import time
 from datetime import datetime, timezone
 from typing import List, Optional
 
 
 CLI_VERSION = "0.1.5"  # Match current gemini-cli version
+
+# ====================== OAuth Configuration ======================
+
+# OAuth Configuration - 标准模式
+CLIENT_ID = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
+CLIENT_SECRET = "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"
+SCOPES = [
+    "https://www.googleapis.com/auth/cloud-platform",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
+]
+
+# Antigravity OAuth Configuration
+ANTIGRAVITY_CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
+ANTIGRAVITY_CLIENT_SECRET = "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"
+ANTIGRAVITY_SCOPES = [
+    'https://www.googleapis.com/auth/cloud-platform',
+    'https://www.googleapis.com/auth/userinfo.email',
+    'https://www.googleapis.com/auth/userinfo.profile',
+    'https://www.googleapis.com/auth/cclog',
+    'https://www.googleapis.com/auth/experimentsandconfigs'
+]
+
+# 统一的 Token URL（两种模式相同）
+TOKEN_URL = "https://oauth2.googleapis.com/token"
+
+# 回调服务器配置
+CALLBACK_HOST = "localhost"
+
+# ====================== Antigravity API Configuration ======================
+
+# Antigravity API Host and User-Agent (shared by antigravity_api.py and google_oauth_api.py)
+ANTIGRAVITY_HOST = "daily-cloudcode-pa.sandbox.googleapis.com"
+ANTIGRAVITY_USER_AGENT = "antigravity/1.11.3 windows/amd64"
 
 # ====================== Model Configuration ======================
 
@@ -28,8 +61,6 @@ BASE_MODELS = [
     "gemini-2.5-flash",
     "gemini-3-pro-preview",
 ]
-
-PUBLIC_API_MODELS = ["gemini-2.5-flash-image", "gemini-2.5-flash-image-preview"]
 
 
 # ====================== Model Helper Functions ======================
@@ -126,9 +157,6 @@ def get_available_models(router_type: str = "openai") -> List[str]:
         # 基础模型
         models.append(base_model)
 
-        if base_model in PUBLIC_API_MODELS:
-            continue
-
         # 假流式模型 (前缀格式)
         models.append(f"假流式/{base_model}")
 
@@ -159,6 +187,32 @@ def get_available_models(router_type: str = "openai") -> List[str]:
             models.append(f"流式抗截断/{base_model}{combined_suffix}")
 
     return models
+
+
+def get_model_group(model_name: str) -> str:
+    """
+    获取模型组，用于 GCLI CD 机制。
+
+    Args:
+        model_name: 模型名称
+
+    Returns:
+        "pro" 或 "flash"
+
+    说明:
+        - pro 组: gemini-2.5-pro, gemini-3-pro-preview 共享额度
+        - flash 组: gemini-2.5-flash 单独额度
+    """
+    # 去除功能前缀和后缀，获取基础模型名
+    base_model = get_base_model_from_feature_model(model_name)
+    base_model = get_base_model_name(base_model)
+
+    # 判断模型组
+    if "flash" in base_model.lower():
+        return "flash"
+    else:
+        # pro 模型（包括 gemini-2.5-pro 和 gemini-3-pro-preview）
+        return "pro"
 
 
 # ====================== User Agent ======================
@@ -202,48 +256,23 @@ def parse_quota_reset_timestamp(error_response: dict) -> Optional[float]:
     }
     """
     try:
-        error = error_response.get("error", {})
-        details = error.get("details", [])
+        details = error_response.get("error", {}).get("details", [])
 
         for detail in details:
-            # 查找包含quota重置信息的detail
             if detail.get("@type") == "type.googleapis.com/google.rpc.ErrorInfo":
-                metadata = detail.get("metadata", {})
-                reset_timestamp_str = metadata.get("quotaResetTimeStamp")
+                reset_timestamp_str = detail.get("metadata", {}).get("quotaResetTimeStamp")
 
                 if reset_timestamp_str:
-                    # 解析ISO 8601格式的时间戳
-                    # 支持格式: "2025-11-30T14:57:24Z" 或 "2025-11-30T14:57:24+00:00"
                     if reset_timestamp_str.endswith("Z"):
                         reset_timestamp_str = reset_timestamp_str.replace("Z", "+00:00")
 
                     reset_dt = datetime.fromisoformat(reset_timestamp_str)
-
-                    # 确保时区信息
                     if reset_dt.tzinfo is None:
                         reset_dt = reset_dt.replace(tzinfo=timezone.utc)
 
-                    # 转换为Unix时间戳（使用UTC时间计算，避免本地时区影响）
-                    # 方法1：先转为UTC，再计算时间戳
-                    reset_dt_utc = reset_dt.astimezone(timezone.utc)
-                    # 方法2：使用 datetime(1970,1,1, tzinfo=utc) 作为基准计算
-                    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-                    return (reset_dt_utc - epoch).total_seconds()
-
-            # 也尝试从RetryInfo中提取延迟时间（作为备用）
-            elif detail.get("@type") == "type.googleapis.com/google.rpc.RetryInfo":
-                retry_delay_str = detail.get("retryDelay")
-                if retry_delay_str:
-                    # 解析延迟时间格式: "47941.209649640s"
-                    if retry_delay_str.endswith("s"):
-                        try:
-                            delay_seconds = float(retry_delay_str[:-1])
-                            return time.time() + delay_seconds
-                        except (ValueError, TypeError):
-                            pass
+                    return reset_dt.astimezone(timezone.utc).timestamp()
 
         return None
 
-    except Exception as e:
-        # 解析失败时不抛出异常，返回None
+    except Exception:
         return None
