@@ -18,6 +18,9 @@ from src.antigravity_anthropic_router import (
     _convert_antigravity_response_to_anthropic_message,
     _estimate_input_tokens_from_components,
 )
+from src.token_estimator import estimate_input_tokens_from_anthropic_request
+from src.token_estimator import estimate_input_tokens_from_components_legacy
+from src.token_estimator import estimate_input_tokens_from_components_with_options
 
 
 def test_clean_json_schema_会追加校验信息到描述():
@@ -94,6 +97,33 @@ def test_clean_json_schema_type_数组在深层items_properties_也会被处理(
     assert row_props["count"]["nullable"] is True
 
 
+def test_clean_json_schema_会移除下游不支持字段_避免400():
+    schema = {
+        "type": "object",
+        "properties": {
+            "age": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "description": "年龄",
+            },
+            "refed": {"$ref": "#/$defs/X"},
+        },
+        "$defs": {"X": {"type": "string"}},
+        "oneOf": [{"type": "object"}],
+        "title": "Example",
+    }
+
+    cleaned = clean_json_schema(schema)
+    # 顶层不支持字段
+    assert "$defs" not in cleaned
+    assert "oneOf" not in cleaned
+    assert "title" not in cleaned
+
+    # properties 内的不支持字段也应被递归移除
+    assert "exclusiveMinimum" not in cleaned["properties"]["age"]
+    assert "$ref" not in cleaned["properties"]["refed"]
+
+
 def test_convert_messages_to_contents_支持多种内容块():
     messages = [
         {
@@ -136,6 +166,84 @@ def test_convert_messages_to_contents_支持多种内容块():
 
     assert contents[1]["role"] == "model"
     assert contents[1]["parts"] == [{"text": "收到"}]
+
+
+def test_convert_messages_to_contents_会过滤仅空白的text块_避免下游400():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "   \n\t  "},
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+                },
+                {"type": "text", "text": "你好"},
+            ],
+        }
+    ]
+
+    contents = convert_messages_to_contents(messages)
+    assert len(contents) == 1
+    assert contents[0]["role"] == "user"
+    assert contents[0]["parts"] == [
+        {"inlineData": {"mimeType": "image/png", "data": "AAAA"}},
+        {"text": "你好"},
+    ]
+
+
+def test_convert_messages_to_contents_仅空白文本会丢弃整条消息():
+    messages = [
+        {"role": "user", "content": "   \n\t  "},
+        {"role": "assistant", "content": "收到"},
+    ]
+
+    contents = convert_messages_to_contents(messages)
+    assert contents == [{"role": "model", "parts": [{"text": "收到"}]}]
+
+
+def test_token_estimator_components_包含特殊标记文本不会归零():
+    components = {
+        "model": "claude-opus-4-5-thinking",
+        "system_instruction": None,
+        "tools": None,
+        "generation_config": None,
+        "contents": [
+            {"role": "user", "parts": [{"text": "你好 <|endoftext|>"}]},
+            {"role": "model", "parts": [{"text": "收到"}]},
+        ],
+    }
+    tokens = _estimate_input_tokens_from_components(components)
+    assert isinstance(tokens, int)
+    assert tokens > 0
+
+
+def test_token_estimator_payload_包含特殊标记文本不会抛异常():
+    payload = {
+        "model": "claude-opus-4-5-thinking",
+        "max_tokens": 10,
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "你好 <|endoftext|>"}]}],
+    }
+    tokens = estimate_input_tokens_from_anthropic_request(payload)
+    assert isinstance(tokens, int)
+    assert tokens > 0
+
+
+def test_token_estimator_components_thinkingConfig_会增加固定开销():
+    base_components = {
+        "model": "claude-opus-4-5-thinking",
+        "system_instruction": None,
+        "tools": None,
+        "generation_config": {},
+        "contents": [{"role": "user", "parts": [{"text": "你好"}]}],
+    }
+    thinking_components = {
+        **base_components,
+        "generation_config": {"thinkingConfig": {"includeThoughts": True, "thinkingBudget": 1024}},
+    }
+    base_raw = estimate_input_tokens_from_components_with_options(base_components, calibrate=False)
+    thinking_raw = estimate_input_tokens_from_components_with_options(thinking_components, calibrate=False)
+    assert thinking_raw - base_raw >= 20
 
 
 def test_convert_request_components_模型映射对齐_converter_py():
@@ -212,6 +320,10 @@ def test_model_mapping_支持_claude_cli_版本化模型名():
     assert map_claude_model_to_gemini(" claude-opus-4-5-20251101 ") == "claude-opus-4-5-thinking"
 
 
+def test_model_mapping_透传_antigravity_实际支持的_gemini_3_pro_image():
+    assert map_claude_model_to_gemini("gemini-3-pro-image") == "gemini-3-pro-image"
+
+
 def test_thinking_null_不会启用_thinkingConfig():
     payload = {
         "model": "claude-3-5-sonnet-20241022",
@@ -281,6 +393,81 @@ def test_antigravity_response_to_anthropic_message_映射_stop_reason_usage():
     assert msg["content"][3]["type"] == "image"
 
 
+def test_antigravity_response_to_anthropic_message_支持_candidate_level_usageMetadata():
+    response_data = {
+        "response": {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": "x"}]},
+                    "finishReason": "STOP",
+                    "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 9},
+                }
+            ]
+        }
+    }
+    msg = _convert_antigravity_response_to_anthropic_message(
+        response_data, model="claude-3-5-sonnet-20241022", message_id="msg_test"
+    )
+    assert msg["usage"] == {"input_tokens": 7, "output_tokens": 9}
+
+
+def test_antigravity_response_to_anthropic_message_缺失_usageMetadata_会回退_input_tokens():
+    response_data = {
+        "response": {
+            "candidates": [{"content": {"parts": [{"text": "x"}]}, "finishReason": "STOP"}],
+        }
+    }
+    msg = _convert_antigravity_response_to_anthropic_message(
+        response_data,
+        model="claude-3-5-sonnet-20241022",
+        message_id="msg_test",
+        fallback_input_tokens=123,
+    )
+    assert msg["usage"] == {"input_tokens": 123, "output_tokens": 0}
+
+
+def test_antigravity_response_to_anthropic_message_tool_use_input_会递归移除null字段():
+    response_data = {
+        "response": {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "functionCall": {
+                                    "id": "t1",
+                                    "name": "code_index_search",
+                                    "args": {
+                                        "query": None,
+                                        "path": "src",
+                                        "options": {"limit": 20, "caseSensitive": None},
+                                        "arr": [1, None, {"x": None, "y": 2}],
+                                    },
+                                }
+                            }
+                        ]
+                    },
+                    "finishReason": "STOP",
+                }
+            ]
+        }
+    }
+
+    msg = _convert_antigravity_response_to_anthropic_message(
+        response_data,
+        model="claude-3-5-sonnet-20241022",
+        message_id="msg_test",
+        fallback_input_tokens=1,
+    )
+    tool_use = next(b for b in msg["content"] if b.get("type") == "tool_use")
+    assert tool_use["name"] == "code_index_search"
+    assert tool_use["input"] == {
+        "path": "src",
+        "options": {"limit": 20},
+        "arr": [1, {"y": 2}],
+    }
+
+
 @pytest.mark.asyncio
 async def test_streaming_事件序列包含必要事件():
     antigravity_lines = [
@@ -315,16 +502,103 @@ async def test_streaming_事件序列包含必要事件():
 
 
 @pytest.mark.asyncio
-async def test_streaming_message_start_会注入估算_input_tokens():
-    payload = {
-        "model": "claude-3-5-sonnet-20241022",
-        "max_tokens": 8,
-        "messages": [{"role": "user", "content": "你好，世界"}],
-    }
-    components = convert_anthropic_request_to_antigravity_components(payload)
-    estimated_input_tokens = _estimate_input_tokens_from_components(components)
-    assert estimated_input_tokens > 0
+async def test_streaming_tool_use_input_json_delta_会递归移除null字段():
+    antigravity_lines = [
+        'data: {"response":{"candidates":[{"content":{"parts":[{"functionCall":{"id":"c1","name":"tool","args":{"query":null,"path":"src","arr":[1,null,2],"obj":{"a":1,"b":null}}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2}}}',
+    ]
 
+    async def gen():
+        for l in antigravity_lines:
+            yield l
+
+    chunks = []
+    async for chunk in antigravity_sse_to_anthropic_sse(gen(), model="m", message_id="msg1"):
+        chunks.append(chunk.decode("utf-8"))
+
+    def parse_event(chunk_str: str):
+        lines = [l for l in chunk_str.splitlines() if l.strip()]
+        event = lines[0].split("event: ", 1)[1].strip()
+        data = json.loads(lines[1].split("data: ", 1)[1])
+        return event, data
+
+    parsed = [parse_event(c) for c in chunks]
+    input_delta = next(
+        data
+        for event, data in parsed
+        if event == "content_block_delta" and (data.get("delta") or {}).get("type") == "input_json_delta"
+    )
+    partial_json = input_delta["delta"]["partial_json"]
+    assert "null" not in partial_json
+    assert json.loads(partial_json) == {"path": "src", "arr": [1, 2], "obj": {"a": 1}}
+
+
+@pytest.mark.asyncio
+async def test_streaming_空文本part_不会产生空text块_避免污染thinking索引():
+    antigravity_lines = [
+        'data: {"response":{"candidates":[{"content":{"parts":[{"text":""},{"thought":true,"text":"A"}]}}]}}',
+        'data: {"response":{"candidates":[{"content":{"parts":[{"text":"B"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2}}}',
+    ]
+
+    async def gen():
+        for l in antigravity_lines:
+            yield l
+
+    chunks = []
+    async for chunk in antigravity_sse_to_anthropic_sse(gen(), model="m", message_id="msg1"):
+        chunks.append(chunk.decode("utf-8"))
+
+    def parse_event(chunk_str: str):
+        lines = [l for l in chunk_str.splitlines() if l.strip()]
+        assert lines[0].startswith("event: ")
+        assert lines[1].startswith("data: ")
+        event = lines[0].split("event: ", 1)[1].strip()
+        data = json.loads(lines[1].split("data: ", 1)[1])
+        return event, data
+
+    parsed = [parse_event(c) for c in chunks]
+
+    assert not any(
+        event == "content_block_start"
+        and data.get("index") == 0
+        and (data.get("content_block") or {}).get("type") == "text"
+        for event, data in parsed
+    )
+
+    starts = [(event, data) for event, data in parsed if event == "content_block_start"]
+    assert starts[0][1]["index"] == 0
+    assert starts[0][1]["content_block"]["type"] == "thinking"
+    assert starts[1][1]["index"] == 1
+    assert starts[1][1]["content_block"]["type"] == "text"
+
+
+@pytest.mark.asyncio
+async def test_streaming_message_start_优先使用下游_promptTokenCount():
+    antigravity_lines = [
+        'data: {"response":{"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":0},"candidates":[{"content":{"parts":[]}}]}}',
+    ]
+
+    async def gen():
+        for l in antigravity_lines:
+            yield l
+
+    chunks = []
+    async for chunk in antigravity_sse_to_anthropic_sse(
+        gen(),
+        model="m",
+        message_id="msg1",
+        initial_input_tokens=77,
+    ):
+        chunks.append(chunk.decode("utf-8"))
+
+    first = chunks[0]
+    lines = [l for l in first.splitlines() if l.strip()]
+    assert lines[0] == "event: message_start"
+    data = json.loads(lines[1].split("data: ", 1)[1])
+    assert data["message"]["usage"]["input_tokens"] == 7
+
+
+@pytest.mark.asyncio
+async def test_streaming_message_start_缺失_usageMetadata_会回退到估算_input_tokens():
     async def gen():
         if False:
             yield ""
@@ -334,7 +608,7 @@ async def test_streaming_message_start_会注入估算_input_tokens():
         gen(),
         model="m",
         message_id="msg1",
-        initial_input_tokens=estimated_input_tokens,
+        initial_input_tokens=77,
     ):
         chunks.append(chunk.decode("utf-8"))
 
@@ -342,7 +616,151 @@ async def test_streaming_message_start_会注入估算_input_tokens():
     lines = [l for l in first.splitlines() if l.strip()]
     assert lines[0] == "event: message_start"
     data = json.loads(lines[1].split("data: ", 1)[1])
-    assert data["message"]["usage"]["input_tokens"] == estimated_input_tokens
+    assert data["message"]["usage"]["input_tokens"] == 77
+
+
+@pytest.mark.asyncio
+async def test_streaming_message_delta_缺失_usageMetadata_会回退到估算_input_tokens():
+    async def gen():
+        if False:
+            yield ""
+
+    chunks = []
+    async for chunk in antigravity_sse_to_anthropic_sse(
+        gen(),
+        model="m",
+        message_id="msg1",
+        initial_input_tokens=77,
+    ):
+        chunks.append(chunk.decode("utf-8"))
+
+    def parse_event(chunk_str: str):
+        lines = [l for l in chunk_str.splitlines() if l.strip()]
+        event = lines[0].split("event: ", 1)[1].strip()
+        data = json.loads(lines[1].split("data: ", 1)[1])
+        return event, data
+
+    parsed = [parse_event(c) for c in chunks]
+    # 倒数第二个事件是 message_delta
+    assert parsed[-2][0] == "message_delta"
+    assert parsed[-2][1]["usage"]["input_tokens"] == 77
+    assert parsed[-2][1]["usage"]["output_tokens"] == 0
+
+
+@pytest.mark.asyncio
+async def test_streaming_message_delta_支持_candidate_level_usageMetadata():
+    antigravity_lines = [
+        'data: {"response":{"candidates":[{"content":{"parts":[{"text":"A"}]}}]}}',
+        'data: {"response":{"candidates":[{"finishReason":"STOP","usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":9}}]}}',
+    ]
+
+    async def gen():
+        for l in antigravity_lines:
+            yield l
+
+    chunks = []
+    async for chunk in antigravity_sse_to_anthropic_sse(gen(), model="m", message_id="msg1"):
+        chunks.append(chunk.decode("utf-8"))
+
+    def parse_event(chunk_str: str):
+        lines = [l for l in chunk_str.splitlines() if l.strip()]
+        event = lines[0].split("event: ", 1)[1].strip()
+        data = json.loads(lines[1].split("data: ", 1)[1])
+        return event, data
+
+    parsed = [parse_event(c) for c in chunks]
+    assert parsed[-2][0] == "message_delta"
+    assert parsed[-2][1]["usage"]["input_tokens"] == 7
+    assert parsed[-2][1]["usage"]["output_tokens"] == 9
+
+
+@pytest.mark.asyncio
+async def test_streaming_thoughtSignature_延迟到达_会输出_signature_delta():
+    antigravity_lines = [
+        'data: {"response":{"candidates":[{"content":{"parts":[{"thought":true,"text":"A"}]}}]}}',
+        'data: {"response":{"candidates":[{"content":{"parts":[{"text":"","thoughtSignature":"sigX"}]}}]}}',
+        'data: {"response":{"candidates":[{"content":{"parts":[{"text":"B"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2}}}',
+    ]
+
+    async def gen():
+        for l in antigravity_lines:
+            yield l
+
+    chunks = []
+    async for chunk in antigravity_sse_to_anthropic_sse(
+        gen(),
+        model="m",
+        message_id="msg1",
+        initial_input_tokens=1,
+    ):
+        chunks.append(chunk.decode("utf-8"))
+
+    def parse_event(chunk_str: str):
+        lines = [l for l in chunk_str.splitlines() if l.strip()]
+        event = lines[0].split("event: ", 1)[1].strip()
+        data = json.loads(lines[1].split("data: ", 1)[1])
+        return event, data
+
+    parsed = [parse_event(c) for c in chunks]
+    signature_delta = next(
+        data
+        for event, data in parsed
+        if event == "content_block_delta" and (data.get("delta") or {}).get("type") == "signature_delta"
+    )
+    assert signature_delta["delta"]["signature"] == "sigX"
+
+
+def test_count_tokens_图片不会按base64纯文本爆炸():
+    payload = {
+        "model": "claude-3-5-sonnet-20241022",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "看图"},
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/png", "data": "A" * 40000},
+                    },
+                ],
+            }
+        ],
+        "max_tokens": 8,
+    }
+
+    estimated = estimate_input_tokens_from_anthropic_request(payload)
+    assert estimated > 0
+    # 若把 base64 当纯文本，token 通常会非常大；这里用一个宽松上界确保没有数量级偏差。
+    assert estimated < 5000
+
+
+def test_count_tokens_tiktoken_相比旧估算对中文与工具更不容易偏小():
+    payload = {
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "你" * 200}],
+        "tools": [
+            {
+                "name": "tool",
+                "description": "测试工具",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "q": {"type": "string", "description": "查询词，中文测试" * 50}
+                    },
+                    "required": ["q"],
+                },
+            }
+        ],
+    }
+    components = convert_anthropic_request_to_antigravity_components(payload)
+
+    estimated = _estimate_input_tokens_from_components(components)
+    legacy = estimate_input_tokens_from_components_legacy(components)
+
+    assert legacy > 0
+    assert estimated > 0
+    assert estimated >= legacy
 
 
 @pytest.mark.asyncio

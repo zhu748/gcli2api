@@ -6,19 +6,20 @@ Antigravity Router - Handles OpenAI and Gemini format requests and converts to A
 import json
 import time
 import uuid
-from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from config import get_anti_truncation_max_attempts
 from log import log
+from src.utils import is_anti_truncation_model, authenticate_bearer, authenticate_gemini_flexible, authenticate_sdwebui_flexible
 
 from .antigravity_api import (
     build_antigravity_request_body,
     send_antigravity_request_no_stream,
     send_antigravity_request_stream,
+    fetch_available_models,
 )
 from .credential_manager import CredentialManager
 from .models import (
@@ -32,72 +33,24 @@ from .models import (
     OpenAIToolCall,
     OpenAIToolFunction,
 )
+from .anti_truncation import (
+    apply_anti_truncation_to_stream,
+)
 
 # 创建路由器
 router = APIRouter()
-security = HTTPBearer()
 
 # 全局凭证管理器实例
 credential_manager = None
 
 
-@asynccontextmanager
 async def get_credential_manager():
     """获取全局凭证管理器实例"""
     global credential_manager
     if not credential_manager:
         credential_manager = CredentialManager()
         await credential_manager.initialize()
-    yield credential_manager
-
-
-async def authenticate(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
-    """验证用户密码"""
-    from config import get_api_password
-
-    password = await get_api_password()
-    token = credentials.credentials
-    if token != password:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="密码错误")
-    return token
-
-
-async def authenticate_gemini_flexible(
-    request: Request,
-    x_goog_api_key: Optional[str] = Header(None, alias="x-goog-api-key"),
-    key: Optional[str] = Query(None),
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(lambda: None),
-) -> str:
-    """灵活验证：支持x-goog-api-key头部、URL参数key或Authorization Bearer"""
-    from config import get_api_password
-
-    password = await get_api_password()
-
-    # 尝试从URL参数key获取（Google官方标准方式）
-    if key:
-        log.debug("Using URL parameter key authentication")
-        if key == password:
-            return key
-
-    # 尝试从Authorization头获取（兼容旧方式）
-    auth_header = request.headers.get("authorization")
-    if auth_header and auth_header.startswith("Bearer "):
-        token = auth_header[7:]  # 移除 "Bearer " 前缀
-        log.debug("Using Bearer token authentication")
-        if token == password:
-            return token
-
-    # 尝试从x-goog-api-key头获取（新标准方式）
-    if x_goog_api_key:
-        log.debug("Using x-goog-api-key authentication")
-        if x_goog_api_key == password:
-            return x_goog_api_key
-
-    log.error(f"Authentication failed. Headers: {dict(request.headers)}, Query params: key={key}")
-    raise HTTPException(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        detail="Missing or invalid authentication. Use 'key' URL parameter, 'x-goog-api-key' header, or 'Authorization: Bearer <token>'",
-    )
+    return credential_manager
 
 
 # 模型名称映射
@@ -120,21 +73,13 @@ def model_mapping(model_name: str) -> str:
 
 def is_thinking_model(model_name: str) -> bool:
     """检测是否是思考模型"""
-    thinking_models = [
-        "gemini-2.5-pro",
-        "gemini-3-pro",
-        "claude-sonnet-4-5-thinking",
-        "claude-opus-4-5",  # 会被映射为 claude-opus-4-5-thinking
-    ]
-
     # 检查是否包含 -thinking 后缀
     if "-thinking" in model_name:
         return True
 
-    # 检查是否匹配特定模型
-    for thinking_model in thinking_models:
-        if model_name.startswith(thinking_model):
-            return True
+    # 检查是否包含 pro 关键词
+    if "pro" in model_name.lower():
+        return True
 
     return False
 
@@ -786,8 +731,6 @@ async def convert_antigravity_stream_to_gemini(
 @router.get("/antigravity/v1/models", response_model=ModelList)
 async def list_models():
     """返回 OpenAI 格式的模型列表 - 动态从 Antigravity API 获取"""
-    from src.credential_manager import get_credential_manager
-    from .antigravity_api import fetch_available_models
 
     try:
         # 获取凭证管理器
@@ -801,8 +744,18 @@ async def list_models():
             log.warning("[ANTIGRAVITY] Failed to fetch models from API, returning empty list")
             return ModelList(data=[])
 
-        # models 已经是 OpenAI 格式的字典列表，直接转换为 Model 对象
-        return ModelList(data=[Model(**m) for m in models])
+        # models 已经是 OpenAI 格式的字典列表，扩展为包含抗截断版本
+        expanded_models = []
+        for model in models:
+            # 添加原始模型
+            expanded_models.append(Model(**model))
+
+            # 添加流式抗截断版本
+            anti_truncation_model = model.copy()
+            anti_truncation_model["id"] = f"流式抗截断/{model['id']}"
+            expanded_models.append(Model(**anti_truncation_model))
+
+        return ModelList(data=expanded_models)
 
     except Exception as e:
         log.error(f"[ANTIGRAVITY] Error fetching models: {e}")
@@ -811,7 +764,10 @@ async def list_models():
 
 
 @router.post("/antigravity/v1/chat/completions")
-async def chat_completions(request: Request, token: str = Depends(authenticate)):
+async def chat_completions(
+    request: Request,
+    token: str = Depends(authenticate_bearer)
+):
     """
     处理 OpenAI 格式的聊天完成请求，转换为 Antigravity API
     """
@@ -851,11 +807,18 @@ async def chat_completions(request: Request, token: str = Depends(authenticate))
     stream = getattr(request_data, "stream", False)
     tools = getattr(request_data, "tools", None)
 
+    # 检测并处理抗截断模式
+    use_anti_truncation = is_anti_truncation_model(model)
+    if use_anti_truncation:
+        # 去掉 "流式抗截断/" 前缀
+        from src.utils import get_base_model_from_feature_model
+        model = get_base_model_from_feature_model(model)
+
     # 模型名称映射
     actual_model = model_mapping(model)
     enable_thinking = is_thinking_model(model)
 
-    log.info(f"[ANTIGRAVITY] Request: model={model} -> {actual_model}, stream={stream}, thinking={enable_thinking}")
+    log.info(f"[ANTIGRAVITY] Request: model={model} -> {actual_model}, stream={stream}, thinking={enable_thinking}, anti_truncation={use_anti_truncation}")
 
     # 转换消息格式
     try:
@@ -878,15 +841,15 @@ async def chat_completions(request: Request, token: str = Depends(authenticate))
 
     generation_config = generate_generation_config(parameters, enable_thinking, actual_model)
 
-    # 获取凭证信息（用于 projectId 和 sessionId）
+    # 获取凭证信息（用于 project_id 和 session_id）
     cred_result = await cred_mgr.get_valid_credential(is_antigravity=True)
     if not cred_result:
         log.error("当前无可用 antigravity 凭证")
         raise HTTPException(status_code=500, detail="当前无可用 antigravity 凭证")
 
     _, credential_data = cred_result
-    project_id = credential_data.get("projectId", "default-project")
-    session_id = credential_data.get("sessionId", f"session-{uuid.uuid4().hex}")
+    project_id = credential_data.get("project_id", "default-project")
+    session_id = f"session-{uuid.uuid4().hex}"
 
     # 构建 Antigravity 请求体
     request_body = build_antigravity_request_body(
@@ -904,7 +867,29 @@ async def chat_completions(request: Request, token: str = Depends(authenticate))
     # 发送请求
     try:
         if stream:
-            # 流式请求
+            # 处理抗截断功能（仅流式传输时有效）
+            if use_anti_truncation:
+                log.info("[ANTIGRAVITY] 启用流式抗截断功能")
+                max_attempts = await get_anti_truncation_max_attempts()
+
+                # 包装请求函数以适配抗截断处理器
+                async def antigravity_request_func(payload):
+                    resources, cred_name, cred_data = await send_antigravity_request_stream(
+                        payload, cred_mgr
+                    )
+                    response, stream_ctx, client = resources
+                    return StreamingResponse(
+                        convert_antigravity_stream_to_openai(
+                            response, stream_ctx, client, model, request_id, cred_mgr, cred_name
+                        ),
+                        media_type="text/event-stream"
+                    )
+
+                return await apply_anti_truncation_to_stream(
+                    antigravity_request_func, request_body, max_attempts
+                )
+
+            # 流式请求（无抗截断）
             resources, cred_name, cred_data = await send_antigravity_request_stream(
                 request_body, cred_mgr
             )
@@ -940,8 +925,6 @@ async def chat_completions(request: Request, token: str = Depends(authenticate))
 @router.get("/antigravity/v1/models")
 async def gemini_list_models(api_key: str = Depends(authenticate_gemini_flexible)):
     """返回 Gemini 格式的模型列表 - 动态从 Antigravity API 获取"""
-    from src.credential_manager import get_credential_manager
-    from .antigravity_api import fetch_available_models
 
     try:
         # 获取凭证管理器
@@ -955,15 +938,27 @@ async def gemini_list_models(api_key: str = Depends(authenticate_gemini_flexible
             log.warning("[ANTIGRAVITY GEMINI] Failed to fetch models from API, returning empty list")
             return JSONResponse(content={"models": []})
 
-        # 将 OpenAI 格式转换为 Gemini 格式
+        # 将 OpenAI 格式转换为 Gemini 格式，同时添加抗截断版本
         gemini_models = []
         for model in models:
             model_id = model.get("id", "")
+
+            # 添加原始模型
             gemini_models.append({
                 "name": f"models/{model_id}",
                 "version": "001",
                 "displayName": model_id,
                 "description": f"Antigravity API - {model_id}",
+                "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
+            })
+
+            # 添加流式抗截断版本
+            anti_truncation_id = f"流式抗截断/{model_id}"
+            gemini_models.append({
+                "name": f"models/{anti_truncation_id}",
+                "version": "001",
+                "displayName": anti_truncation_id,
+                "description": f"Antigravity API - {anti_truncation_id} (带流式抗截断功能)",
                 "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
             })
 
@@ -1022,6 +1017,13 @@ async def gemini_generate_content(
     if model.startswith("models/"):
         model = model[7:]
 
+    # 检测并处理抗截断模式（虽然非流式不会使用，但要处理模型名）
+    use_anti_truncation = is_anti_truncation_model(model)
+    if use_anti_truncation:
+        # 去掉 "流式抗截断/" 前缀
+        from src.utils import get_base_model_from_feature_model
+        model = get_base_model_from_feature_model(model)
+
     # 模型名称映射
     actual_model = model_mapping(model)
     enable_thinking = is_thinking_model(model)
@@ -1053,15 +1055,15 @@ async def gemini_generate_content(
 
     generation_config = generate_generation_config(parameters, enable_thinking, actual_model)
 
-    # 获取凭证信息（用于 projectId 和 sessionId）
+    # 获取凭证信息（用于 project_id 和 session_id）
     cred_result = await cred_mgr.get_valid_credential(is_antigravity=True)
     if not cred_result:
         log.error("当前无可用 antigravity 凭证")
         raise HTTPException(status_code=500, detail="当前无可用 antigravity 凭证")
 
     _, credential_data = cred_result
-    project_id = credential_data.get("projectId", "default-project")
-    session_id = credential_data.get("sessionId", f"session-{uuid.uuid4().hex}")
+    project_id = credential_data.get("project_id", "default-project")
+    session_id = credential_data.get("session_id", f"session-{uuid.uuid4().hex}")
 
     # 处理 systemInstruction
     system_instruction = None
@@ -1129,11 +1131,18 @@ async def gemini_stream_generate_content(
     if model.startswith("models/"):
         model = model[7:]
 
+    # 检测并处理抗截断模式
+    use_anti_truncation = is_anti_truncation_model(model)
+    if use_anti_truncation:
+        # 去掉 "流式抗截断/" 前缀
+        from src.utils import get_base_model_from_feature_model
+        model = get_base_model_from_feature_model(model)
+
     # 模型名称映射
     actual_model = model_mapping(model)
     enable_thinking = is_thinking_model(model)
 
-    log.info(f"[ANTIGRAVITY GEMINI] Stream request: model={model} -> {actual_model}, thinking={enable_thinking}")
+    log.info(f"[ANTIGRAVITY GEMINI] Stream request: model={model} -> {actual_model}, thinking={enable_thinking}, anti_truncation={use_anti_truncation}")
 
     # 转换 Gemini contents 为 Antigravity contents
     try:
@@ -1160,15 +1169,15 @@ async def gemini_stream_generate_content(
 
     generation_config = generate_generation_config(parameters, enable_thinking, actual_model)
 
-    # 获取凭证信息（用于 projectId 和 sessionId）
+    # 获取凭证信息（用于 project_id 和 session_id）
     cred_result = await cred_mgr.get_valid_credential(is_antigravity=True)
     if not cred_result:
         log.error("当前无可用 antigravity 凭证")
         raise HTTPException(status_code=500, detail="当前无可用 antigravity 凭证")
 
     _, credential_data = cred_result
-    project_id = credential_data.get("projectId", "default-project")
-    session_id = credential_data.get("sessionId", f"session-{uuid.uuid4().hex}")
+    project_id = credential_data.get("project_id", "default-project")
+    session_id = credential_data.get("session_id", f"session-{uuid.uuid4().hex}")
 
     # 处理 systemInstruction
     system_instruction = None
@@ -1194,6 +1203,29 @@ async def gemini_stream_generate_content(
 
     # 发送流式请求
     try:
+        # 处理抗截断功能（仅流式传输时有效）
+        if use_anti_truncation:
+            log.info("[ANTIGRAVITY GEMINI] 启用流式抗截断功能")
+            max_attempts = await get_anti_truncation_max_attempts()
+
+            # 包装请求函数以适配抗截断处理器
+            async def antigravity_gemini_request_func(payload):
+                resources, cred_name, cred_data = await send_antigravity_request_stream(
+                    payload, cred_mgr
+                )
+                response, stream_ctx, client = resources
+                return StreamingResponse(
+                    convert_antigravity_stream_to_gemini(
+                        response, stream_ctx, client, cred_mgr, cred_name
+                    ),
+                    media_type="text/event-stream"
+                )
+
+            return await apply_anti_truncation_to_stream(
+                antigravity_gemini_request_func, request_body, max_attempts
+            )
+
+        # 流式请求（无抗截断）
         resources, cred_name, cred_data = await send_antigravity_request_stream(
             request_body, cred_mgr
         )
@@ -1212,4 +1244,207 @@ async def gemini_stream_generate_content(
     except Exception as e:
         log.error(f"[ANTIGRAVITY GEMINI] Stream request failed: {e}")
         raise HTTPException(status_code=500, detail=f"Antigravity API request failed: {str(e)}")
+
+
+# ==================== SD-WebUI 格式 API 端点 ====================
+
+@router.get("/sdapi/v1/options")
+@router.get("/antigravity/sdapi/v1/options")
+async def sdwebui_get_options(_: str = Depends(authenticate_sdwebui_flexible)):
+    """返回 SD-WebUI 格式的配置选项"""
+    log.info("[ANTIGRAVITY SD-WebUI] Received options request")
+    # 返回基本的配置选项
+    return {
+        "sd_model_checkpoint": "gemini-3-pro-image",
+        "sd_checkpoint_hash": None,
+        "samples_save": True,
+        "samples_format": "png",
+        "save_images_add_number": True,
+        "grid_save": True,
+        "return_grid": True,
+        "enable_pnginfo": True,
+        "save_txt": False,
+        "CLIP_stop_at_last_layers": 1,
+    }
+
+
+@router.get("/sdapi/v1/sd-models")
+@router.get("/antigravity/sdapi/v1/sd-models")
+async def sdwebui_list_models(_: str = Depends(authenticate_sdwebui_flexible)):
+    """返回 SD-WebUI 格式的模型列表 - 只包含带 image 关键词的模型"""
+
+    try:
+        # 获取凭证管理器
+        cred_mgr = await get_credential_manager()
+
+        # 从 Antigravity API 获取模型列表
+        models = await fetch_available_models(cred_mgr)
+
+        if not models:
+            log.warning("[ANTIGRAVITY SD-WebUI] Failed to fetch models from API, returning empty list")
+            return []
+
+        # 过滤只包含 "image" 关键词的模型
+        image_models = []
+        for model in models:
+            model_id = model.get("id", "")
+            if "image" in model_id.lower():
+                # SD-WebUI 格式: {"title": "model_name", "model_name": "model_name", "hash": null}
+                image_models.append({
+                    "title": model_id,
+                    "model_name": model_id,
+                    "hash": None,
+                    "sha256": None,
+                    "filename": model_id,
+                    "config": None
+                })
+
+        return image_models
+
+    except Exception as e:
+        log.error(f"[ANTIGRAVITY SD-WebUI] Error fetching models: {e}")
+        return []
+
+
+@router.post("/sdapi/v1/txt2img")
+@router.post("/antigravity/sdapi/v1/txt2img")
+async def sdwebui_txt2img(request: Request, _: str = Depends(authenticate_sdwebui_flexible)):
+    """处理 SD-WebUI 格式的 txt2img 请求，转换为 Antigravity API"""
+    # 获取原始请求数据
+    try:
+        request_data = await request.json()
+    except Exception as e:
+        log.error(f"Failed to parse JSON request: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
+
+    # 提取基本参数
+    prompt = request_data.get("prompt", "")
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Missing required field: prompt")
+
+    negative_prompt = request_data.get("negative_prompt", "")
+
+    # 提取图片生成相关参数
+    width = request_data.get("width", 1024)
+    height = request_data.get("height", 1024)
+
+    # 计算 aspect_ratio - 映射到支持的比例
+    # 支持的比例: "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"
+    def find_closest_aspect_ratio(w: int, h: int) -> str:
+        ratio = w / h
+        supported_ratios = {
+            "1:1": 1.0,
+            "2:3": 0.667,
+            "3:2": 1.5,
+            "3:4": 0.75,
+            "4:3": 1.333,
+            "4:5": 0.8,
+            "5:4": 1.25,
+            "9:16": 0.5625,
+            "16:9": 1.778,
+            "21:9": 2.333
+        }
+        closest = min(supported_ratios.items(), key=lambda x: abs(x[1] - ratio))
+        return closest[0]
+
+    aspect_ratio = find_closest_aspect_ratio(width, height)
+
+    # 简化的尺寸映射到 image_size
+    max_dimension = max(width, height)
+    if max_dimension <= 1024:
+        image_size = "1K"
+    elif max_dimension <= 2048:
+        image_size = "2K"
+    else:
+        image_size = "4K"
+
+    # 提取模型（如果指定）
+    model = request_data.get("override_settings", {}).get("sd_model_checkpoint", "gemini-3-pro-image")
+    if not model or "image" not in model.lower():
+        model = "gemini-3-pro-image"
+
+    log.info(f"[ANTIGRAVITY SD-WebUI] txt2img request: model={model}, prompt={prompt[:50]}..., aspect_ratio={aspect_ratio}, image_size={image_size}")
+
+    cred_mgr = await get_credential_manager()
+
+    # 构建 Gemini 格式的 contents
+    full_prompt = prompt
+    if negative_prompt:
+        full_prompt = f"{prompt}\n\nNegative prompt: {negative_prompt}"
+
+    contents = [{
+        "role": "user",
+        "parts": [{"text": full_prompt}]
+    }]
+
+    # 构建 generation_config，包含图片生成参数
+    parameters = {
+        "response_modalities": ["TEXT", "IMAGE"],
+        "image_config": {
+            "aspect_ratio": aspect_ratio,
+            "image_size": image_size
+        }
+    }
+
+    # 模型名称映射
+    actual_model = model_mapping(model)
+    enable_thinking = is_thinking_model(model)
+
+    generation_config = generate_generation_config(parameters, enable_thinking, actual_model)
+
+    # 获取凭证信息
+    cred_result = await cred_mgr.get_valid_credential(is_antigravity=True)
+    if not cred_result:
+        log.error("当前无可用 antigravity 凭证")
+        raise HTTPException(status_code=500, detail="当前无可用 antigravity 凭证")
+
+    _, credential_data = cred_result
+    project_id = credential_data.get("project_id", "default-project")
+    session_id = f"session-{uuid.uuid4().hex}"
+
+    # 构建 Antigravity 请求体
+    request_body = build_antigravity_request_body(
+        contents=contents,
+        model=actual_model,
+        project_id=project_id,
+        session_id=session_id,
+        tools=None,
+        generation_config=generation_config,
+    )
+
+    # 发送非流式请求
+    try:
+        response_data, cred_name, cred_data = await send_antigravity_request_no_stream(
+            request_body, cred_mgr
+        )
+
+        # 提取生成的图片
+        parts = response_data.get("response", {}).get("candidates", [{}])[0].get("content", {}).get("parts", [])
+
+        images = []
+        info_text = ""
+
+        for part in parts:
+            if "inlineData" in part:
+                inline_data = part["inlineData"]
+                base64_data = inline_data.get("data", "")
+                images.append(base64_data)
+            elif "text" in part:
+                info_text += part.get("text", "")
+
+        if not images:
+            raise HTTPException(status_code=500, detail="No images generated")
+
+        # 构建 SD-WebUI 格式的响应
+        sdwebui_response = {
+            "images": images,
+            "parameters": request_data,
+            "info": info_text or f"Generated by {model}"
+        }
+
+        return JSONResponse(content=sdwebui_response)
+
+    except Exception as e:
+        log.error(f"[ANTIGRAVITY SD-WebUI] txt2img request failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Image generation failed: {str(e)}")
 

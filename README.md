@@ -108,14 +108,7 @@
 - 批量配置管理
 - 统一批量上传界面管理所有凭证类型
 
-### 📈 使用统计和监控
-
-**详细使用统计**
-- 按凭证文件统计调用次数
-- Gemini 2.5 Pro 模型专项统计
-- 每日配额管理
-- 聚合统计和分析
-- 自定义每日限制配置
+### 📈 使用监控
 
 **实时监控**
 - WebSocket 实时日志流
@@ -242,6 +235,32 @@ docker run -d --name gcli2api --network host -e PASSWORD=pwd -e PORT=7861 -v $(p
 
 # 使用分离密码
 docker run -d --name gcli2api --network host -e API_PASSWORD=api_pwd -e PANEL_PASSWORD=panel_pwd -e PORT=7861 -v $(pwd)/data/creds:/app/creds ghcr.io/su-kaka/gcli2api:latest
+```
+
+**Docker Mac**
+```bash
+# 使用通用密码
+docker run -d \
+  --name gcli2api \
+  -p 7861:7861 \
+  -p 8080:8080 \
+  -e PASSWORD=pwd \
+  -e PORT=7861 \
+  -v "$(pwd)/data/creds":/app/creds \
+  ghcr.io/su-kaka/gcli2api:latest
+```
+
+```bash
+# 使用分离密码
+docker run -d \
+--name gcli2api \
+-p 7861:7861 \
+-p 8080:8080 \
+-e API_PASSWORD=api_pwd \
+-e PANEL_PASSWORD=panel_pwd \
+-e PORT=7861 \
+-v $(pwd)/data/creds:/app/creds \
+ghcr.io/su-kaka/gcli2api:latest
 ```
 
 **Docker Compose 运行命令**
